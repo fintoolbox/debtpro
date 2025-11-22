@@ -1,7 +1,12 @@
 "use client";
 
-import { useState, type ChangeEvent } from "react";
+import { useState, useMemo, useEffect, type ChangeEvent } from "react";
 import EmailLink from "./components/EmailLink";
+import {
+  runDebtProSimulation,
+  type BaseInputs,
+  type TipInputs,
+} from "../lib/debtProEngine";
 
 /* Utility functions */
 function formatCurrency(value: number): string {
@@ -13,14 +18,9 @@ function formatCurrency(value: number): string {
   });
 }
 
-function formatYearsMonths(totalMonths: number): string {
-  if (!Number.isFinite(totalMonths) || totalMonths <= 0) return "-";
-  const months = Math.round(totalMonths);
-  const years = Math.floor(months / 12);
-  const remainingMonths = months % 12;
-  if (years === 0) return `${remainingMonths} months`;
-  if (remainingMonths === 0) return `${years} years`;
-  return `${years} years ${remainingMonths} months`;
+function formatPercent(value: number): string {
+  if (!Number.isFinite(value)) return "-";
+  return `${value.toFixed(1)}%`;
 }
 
 /* Tip data */
@@ -33,8 +33,7 @@ type Tip = {
 const TIPS: Tip[] = [
   {
     id: 1,
-    title:
-      "Budget effectively to find surplus income for extra repayments",
+    title: "Budget effectively to find surplus income for extra repayments",
     body:
       "The fastest way to reduce your mortgage is to find a surplus in your budget and consistently add it to your home loan repayments. This may come from trimming non-essential spending, cancelling unused subscriptions, or redirecting savings from everyday expenses. Even $100–$200 per month can take years off your loan and save thousands in interest.",
   },
@@ -47,15 +46,13 @@ const TIPS: Tip[] = [
   },
   {
     id: 3,
-    title:
-      "Switch to fortnightly repayments (half your monthly amount)",
+    title: "Switch to fortnightly repayments (half your monthly amount)",
     body:
       "There are 26 fortnights in a year, which is equivalent to 13 monthly repayments. By paying half your normal monthly repayment every fortnight, you effectively make one extra repayment each year, directly reducing your principal faster.",
   },
   {
     id: 4,
-    title:
-      "Increase repayments each year when your salary increases",
+    title: "Increase repayments each year when your salary increases",
     body:
       "When your income goes up, commit to increasing your home loan repayments instead of your lifestyle spending. Because you never get used to the extra cash in your pocket, you’re unlikely to miss it—but your mortgage balance will reduce more quickly.",
   },
@@ -67,69 +64,11 @@ const TIPS: Tip[] = [
   },
   {
     id: 6,
-    title:
-      "Use debt recycling into an investment portfolio",
+    title: "Use debt recycling into an investment portfolio",
     body:
       "Debt recycling gradually converts non-deductible home loan debt into investment debt. You invest borrowed funds into a portfolio, then use the investment income, franking credits and tax benefits to accelerate your home loan repayments. Done well, this may grow wealth while reducing debt, but it involves investment risk and should be implemented with advice.",
   },
 ];
-
-interface ExtraRepaymentResult {
-  minRepayment: number;
-  baselineInterest: number;
-  baselineMonths: number;
-  payoffMonthsWithExtra: number;
-  interestWithExtra: number;
-  interestSaved: number;
-  monthsSaved: number;
-}
-
-/* Calculator logic */
-function calculateExtraRepaymentScenario(
-  loanAmount: number,
-  interestRate: number,
-  termYears: number,
-  extraPerMonth: number
-): ExtraRepaymentResult | null {
-  const P = loanAmount;
-  const rAnnual = interestRate / 100;
-  const totalMonths = termYears * 12;
-  const extra = extraPerMonth;
-
-  if (!P || !rAnnual || !termYears) return null;
-
-  const monthlyRate = rAnnual / 12;
-
-  const minRepayment =
-    (P * monthlyRate) / (1 - Math.pow(1 + monthlyRate, -totalMonths));
-
-  const baselineInterest = minRepayment * totalMonths - P;
-
-  let balance = P;
-  let month = 0;
-  let totalInterestWithExtra = 0;
-  const repaymentWithExtra = minRepayment + extra;
-
-  while (balance > 0 && month < totalMonths) {
-    const interest = balance * monthlyRate;
-    totalInterestWithExtra += interest;
-    const principal = repaymentWithExtra - interest;
-    balance -= principal;
-    month++;
-  }
-
-  const interestSaved = baselineInterest - totalInterestWithExtra;
-
-  return {
-    minRepayment,
-    baselineInterest,
-    baselineMonths: totalMonths,
-    payoffMonthsWithExtra: month,
-    interestWithExtra: totalInterestWithExtra,
-    interestSaved,
-    monthsSaved: totalMonths - month,
-  };
-}
 
 /* Reusable row for results */
 function ResultRow({
@@ -158,18 +97,62 @@ function ResultRow({
 }
 
 export default function HomePage() {
-  const [loanAmount, setLoanAmount] = useState<number>(600_000);
-  const [interestRate, setInterestRate] = useState<number>(5.5);
-  const [termYears, setTermYears] = useState<number>(30);
-  const [extraPerMonth, setExtraPerMonth] = useState<number>(300);
   const [openTipId, setOpenTipId] = useState<number | null>(1);
 
-  const result = calculateExtraRepaymentScenario(
-    loanAmount,
-    interestRate,
-    termYears,
-    extraPerMonth
+  // ─────────────────────────────────────
+  // 1. Base + tip inputs for engine
+  // ─────────────────────────────────────
+  const [baseInputs, setBaseInputs] = useState<BaseInputs>({
+    propertyValueHome: 900_000,
+    homeLoanBalance: 600_000,
+    homeLoanRate: 0.055, // 5.5% p.a.
+    minRepaymentMonthly: 3_500,
+    marginalTaxRate: 0.39, // 39% including Medicare
+    netIncomeAnnual: 120_000,
+    livingExpensesAnnualExMortgage: 50_000,
+    offsetBalance: 40_000,
+    emergencyFundTarget: 20_000,
+  });
+
+  const [tipInputs, setTipInputs] = useState<TipInputs>({
+  tip1_extraSavingsPerMonth: 300,
+  tip4_salaryGrowthRate: 0.03,
+  tip5_purchaseYear: 5,              // still required by type, but not used in logic now
+  tip5_purchasePrice: 700_000,
+  tip5_purchaseCostsRate: 0.05,      // NEW: 5% purchase costs
+  tip5_rentAnnual: 35_000,
+  tip5_expensesAnnual: 10_000,
+  tip5_ipLoanRate: 0.06,
+  tip6_recyclePerYear: 10_000,
+  tip6_investReturn: 0.07,
+  tip6_dividendYield: 0.04,
+});
+
+  const updateBase = (field: keyof BaseInputs) => (val: number) => {
+    setBaseInputs((prev) => ({ ...prev, [field]: Number(val) || 0 }));
+  };
+
+  const updateTip = (field: keyof TipInputs) => (val: number) => {
+    setTipInputs((prev) => ({ ...prev, [field]: Number(val) || 0 }));
+  };
+
+  // ─────────────────────────────────────
+  // 2. Run simulation
+  // ─────────────────────────────────────
+  const result = useMemo(
+    () => runDebtProSimulation(baseInputs, tipInputs),
+    [baseInputs, tipInputs]
   );
+
+  const years = result.years;
+  const firstYear = years[0];
+  const lastYear = years[years.length - 1];
+
+  const debtFreeYearIndex = result.debtFreeYearIndex;
+  const debtFreeLabel =
+    debtFreeYearIndex !== undefined
+      ? `Year ${debtFreeYearIndex + 1}`
+      : "Not within projection period";
 
   const scrollToSection = (id: string) => {
     if (typeof document === "undefined") return;
@@ -216,8 +199,9 @@ export default function HomePage() {
             </h1>
             <p className="mt-4 text-sm md:text-base text-slate-300 max-w-2xl">
               DebtPro brings together six practical strategies and a focused
-              calculator so you can see how much time and interest you can save
-              by committing to regular extra repayments.
+              simulator so you can see how your income, extra repayments,
+              investment property and debt recycling might work together over
+              time. It&apos;s a projection, not advice.
             </p>
           </section>
 
@@ -242,9 +226,7 @@ export default function HomePage() {
                   >
                     <button
                       type="button"
-                      onClick={() =>
-                        setOpenTipId(isOpen ? null : tip.id)
-                      }
+                      onClick={() => setOpenTipId(isOpen ? null : tip.id)}
                       className="w-full flex justify-between items-center px-4 py-3 text-left hover:bg-slate-800/70"
                     >
                       <div className="flex items-start gap-3">
@@ -281,149 +263,787 @@ export default function HomePage() {
             className="bg-slate-800 rounded-xl border border-slate-700 p-6 shadow-sm"
           >
             <h2 className="text-xl md:text-2xl font-semibold text-slate-100 mb-2">
-              See how fast you could be debt-free
+              Model your full DebtPro plan
             </h2>
             <p className="text-sm text-slate-400 mb-5">
-              Enter your current loan details and an extra repayment amount.
-              This will estimate how much time and interest you might save by
-              sticking with the plan. It&apos;s a simple projection, not advice.
+              Start with your current position, then layer in the tips. This
+              simulator shows annual cashflow and how your assets and
+              liabilities might change over time. It&apos;s a simplified model,
+              not personal advice.
             </p>
 
-            <div className="grid md:grid-cols-2 gap-6">
-              {/* Inputs */}
-              <div className="space-y-4">
-                <InputField
-                  label="Loan balance (approx.)"
-                  value={loanAmount}
-                  onChange={setLoanAmount}
-                  prefix="$"
-                />
-                <InputField
-                  label="Interest rate (p.a.)"
-                  value={interestRate}
-                  onChange={setInterestRate}
-                  suffix="%"
-                />
-                <InputField
-                  label="Remaining loan term (years)"
-                  value={termYears}
-                  onChange={setTermYears}
-                />
-                <InputField
-                  label="Extra repayment (per month)"
-                  value={extraPerMonth}
-                  onChange={setExtraPerMonth}
-                  prefix="$"
-                  helper="This could be your pay rise, side hustle income, or a tighter budget."
-                />
-              </div>
+            <div className="space-y-6">
+  {/* Inputs */}
+  <div className="space-y-5">
+    <div>
+      <p className="text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wide">
+        Step 1 · Your current position
+      </p>
+      <div className="grid gap-3 md:grid-cols-3">
+        <InputField
+          label="Home value (approx.)"
+          value={baseInputs.propertyValueHome}
+          onChange={updateBase("propertyValueHome")}
+          prefix="$"
+        />
+        <InputField
+          label="Home loan balance"
+          value={baseInputs.homeLoanBalance}
+          onChange={updateBase("homeLoanBalance")}
+          prefix="$"
+        />
+        <InputField
+          label="Home loan rate (p.a.)"
+          value={baseInputs.homeLoanRate * 100}
+          onChange={(val) =>
+            setBaseInputs((prev) => ({
+              ...prev,
+              homeLoanRate: (val || 0) / 100,
+            }))
+          }
+          suffix="%"
+        />
+        <InputField
+          label="Minimum repayment (per month)"
+          value={baseInputs.minRepaymentMonthly}
+          onChange={updateBase("minRepaymentMonthly")}
+          prefix="$"
+        />
+        <InputField
+          label="Marginal tax rate incl. Medicare"
+          value={baseInputs.marginalTaxRate * 100}
+          onChange={(val) =>
+            setBaseInputs((prev) => ({
+              ...prev,
+              marginalTaxRate: (val || 0) / 100,
+            }))
+          }
+          suffix="%"
+        />
+        <InputField
+          label="Net income (per year, after tax)"
+          value={baseInputs.netIncomeAnnual}
+          onChange={updateBase("netIncomeAnnual")}
+          prefix="$"
+        />
+        <InputField
+          label="Living expenses (per year, excl. mortgage)"
+          value={baseInputs.livingExpensesAnnualExMortgage}
+          onChange={updateBase("livingExpensesAnnualExMortgage")}
+          prefix="$"
+        />
+        <InputField
+          label="Offset account balance"
+          value={baseInputs.offsetBalance}
+          onChange={updateBase("offsetBalance")}
+          prefix="$"
+        />
+        <InputField
+          label="Emergency fund (kept in offset)"
+          value={baseInputs.emergencyFundTarget}
+          onChange={updateBase("emergencyFundTarget")}
+          prefix="$"
+        />
+      </div>
+    </div>
 
-              {/* Results */}
-              <div className="bg-slate-900 rounded-lg border border-slate-700 p-4 text-sm space-y-3">
-                {!result ? (
-                  <p className="text-slate-500">
-                    Enter your details on the left to see a projection.
-                  </p>
-                ) : (
-                  <>
-                    <ResultRow
-                      label="Minimum monthly repayment"
-                      value={formatCurrency(result.minRepayment)}
-                    />
-                    <ResultRow
-                      label="Time to repay (minimums only)"
-                      value={formatYearsMonths(result.baselineMonths)}
-                    />
-                    <ResultRow
-                      label="Time to repay (with extra)"
-                      value={formatYearsMonths(
-                        result.payoffMonthsWithExtra
-                      )}
-                    />
-                    <ResultRow
-                      label="Time saved from your loan"
-                      value={formatYearsMonths(result.monthsSaved)}
-                      highlight
-                    />
-                    <ResultRow
-                      label="Total interest (no extra)"
-                      value={formatCurrency(result.baselineInterest)}
-                    />
-                    <ResultRow
-                      label="Total interest (with extra)"
-                      value={formatCurrency(result.interestWithExtra)}
-                    />
-                    <ResultRow
-                      label="Interest saved"
-                      value={formatCurrency(result.interestSaved)}
-                      highlight
-                    />
-                    <p className="text-xs text-slate-500 mt-2">
-                      This is general information only. Interest rates, loan
-                      features and your behaviour over time will affect actual
-                      outcomes.
-                    </p>
-                  </>
-                )}
-              </div>
-            </div>
+    <div className="mt-4">
+      <p className="text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wide">
+        Step 2 · Tip inputs
+      </p>
+      <div className="grid gap-3 md:grid-cols-3">
+        <InputField
+          label="Tip 1 · Extra savings to add (per month)"
+          value={tipInputs.tip1_extraSavingsPerMonth}
+          onChange={updateTip("tip1_extraSavingsPerMonth")}
+          prefix="$"
+          helper="Surplus from budgeting, side income, etc."
+        />
+        <InputField
+          label="Tip 4 · Expected salary growth (p.a.)"
+          value={tipInputs.tip4_salaryGrowthRate * 100}
+          onChange={(val) =>
+            setTipInputs((prev) => ({
+              ...prev,
+              tip4_salaryGrowthRate: (val || 0) / 100,
+            }))
+          }
+          suffix="%"
+          helper="Half of each pay rise is directed to your mortgage."
+        />
+        <InputField
+          label="Tip 5 · Investment property purchase price"
+          value={tipInputs.tip5_purchasePrice}
+          onChange={updateTip("tip5_purchasePrice")}
+          prefix="$"
+        />
+        <InputField
+          label="Tip 5 · Purchase costs (% of price)"
+          value={tipInputs.tip5_purchaseCostsRate * 100}
+          onChange={(val) =>
+            setTipInputs((prev) => ({
+              ...prev,
+              tip5_purchaseCostsRate: (val || 0) / 100,
+            }))
+          }
+          suffix="%"
+          helper="Stamp duty, legal fees, etc. as a % of price."
+        />
+        <InputField
+          label="Tip 5 · Annual rent"
+          value={tipInputs.tip5_rentAnnual}
+          onChange={updateTip("tip5_rentAnnual")}
+          prefix="$"
+        />
+        <InputField
+          label="Tip 5 · Annual expenses (rates, insurance, etc.)"
+          value={tipInputs.tip5_expensesAnnual}
+          onChange={updateTip("tip5_expensesAnnual")}
+          prefix="$"
+        />
+        <InputField
+          label="Tip 5 · IP loan rate (p.a.)"
+          value={tipInputs.tip5_ipLoanRate * 100}
+          onChange={(val) =>
+            setTipInputs((prev) => ({
+              ...prev,
+              tip5_ipLoanRate: (val || 0) / 100,
+            }))
+          }
+          suffix="%"
+        />
+        <InputField
+          label="Tip 6 · Amount recycled each year"
+          value={tipInputs.tip6_recyclePerYear}
+          onChange={updateTip("tip6_recyclePerYear")}
+          prefix="$"
+        />
+        <InputField
+          label="Tip 6 · Investment return (p.a.)"
+          value={tipInputs.tip6_investReturn * 100}
+          onChange={(val) =>
+            setTipInputs((prev) => ({
+              ...prev,
+              tip6_investReturn: (val || 0) / 100,
+            }))
+          }
+          suffix="%"
+        />
+        <InputField
+          label="Tip 6 · Dividend / income yield (p.a.)"
+          value={tipInputs.tip6_dividendYield * 100}
+          onChange={(val) =>
+            setTipInputs((prev) => ({
+              ...prev,
+              tip6_dividendYield: (val || 0) / 100,
+            }))
+          }
+          suffix="%"
+        />
+      </div>
+    </div>
+  </div>
+
+  {/* Results Summary – only the "clear home loan" year */}
+  <div className="bg-slate-900 rounded-lg border border-slate-700 p-5 text-sm space-y-3">
+    {!firstYear || !lastYear ? (
+      <p className="text-slate-500">
+        Enter your details above to see when you might be able to clear your home loan.
+      </p>
+    ) : (
+      <>
+        <h3 className="text-base font-semibold text-slate-100 mb-1">
+          When could you clear your home loan?
+        </h3>
+        <p className="text-sm text-slate-200">
+          Based on these inputs and assumptions, you could clear your home loan (by selling the
+          investment property and portfolio) in:{" "}
+          <span className="font-semibold text-emerald-400">
+            {debtFreeLabel}
+          </span>
+          .
+        </p>
+        <p className="text-xs text-slate-500 mt-2">
+          This is a simplified projection only. It assumes you follow the plan consistently and that
+          returns, tax and borrowing rates behave as modelled.
+        </p>
+      </>
+    )}
+  </div>
+</div>
+
+
+            {/* Cashflow & assets table */}
+            {years.length > 0 && (
+  <div className="mt-8 space-y-6">
+    {/* Cashflow table – years as columns */}
+    <div>
+      <h3 className="text-sm font-semibold text-slate-100 mb-2">
+        Annual cashflow overview
+      </h3>
+      <div className="overflow-x-auto">
+        <table className="min-w-full text-[11px] md:text-xs text-left border-collapse border border-slate-800">
+          <thead className="bg-slate-900">
+            <tr>
+              <th className="border border-slate-800 px-2 py-1 sticky left-0 bg-slate-900">
+                Category
+              </th>
+              {years.map((y) => (
+                <th
+                  key={y.yearIndex}
+                  className="border border-slate-800 px-2 py-1 text-right whitespace-nowrap"
+                >
+                  Year {y.yearIndex + 1}
+                  {y.couldClearHomeLoan && (
+                    <span className="ml-1 text-[10px] text-emerald-400">
+                      • can clear
+                    </span>
+                  )}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {/* INCOME ROWS */}
+            <tr className="bg-slate-900/40">
+              <td className="border border-slate-800 px-2 py-1 font-semibold">
+                Income
+              </td>
+              {years.map((y) => (
+                <td
+                  key={`income-header-${y.yearIndex}`}
+                  className="border border-slate-800 px-2 py-1"
+                />
+              ))}
+            </tr>
+            <tr>
+              <td className="border border-slate-800 px-2 py-1">
+                Net income (after tax)
+              </td>
+              {years.map((y) => (
+                <td
+                  key={`netIncome-${y.yearIndex}`}
+                  className="border border-slate-800 px-2 py-1 text-right"
+                >
+                  {formatCurrency(y.netIncome)}
+                </td>
+              ))}
+            </tr>
+            <tr>
+              <td className="border border-slate-800 px-2 py-1">
+                Investment property rent
+              </td>
+              {years.map((y) => (
+                <td
+                  key={`ipRent-${y.yearIndex}`}
+                  className="border border-slate-800 px-2 py-1 text-right"
+                >
+                  {formatCurrency(y.ipRent)}
+                </td>
+              ))}
+            </tr>
+            <tr>
+              <td className="border border-slate-800 px-2 py-1">
+                Investment income (portfolio)
+              </td>
+              {years.map((y) => (
+                <td
+                  key={`investIncome-${y.yearIndex}`}
+                  className="border border-slate-800 px-2 py-1 text-right"
+                >
+                  {formatCurrency(y.investIncome)}
+                </td>
+              ))}
+            </tr>
+            <tr>
+              <td className="border border-slate-800 px-2 py-1">
+                Tax benefit / (extra tax)
+              </td>
+              {years.map((y) => (
+                <td
+                  key={`taxEffect-${y.yearIndex}`}
+                  className={`border border-slate-800 px-2 py-1 text-right ${
+                    y.taxEffectNet > 0
+                      ? "text-emerald-400"
+                      : y.taxEffectNet < 0
+                      ? "text-rose-400"
+                      : ""
+                  }`}
+                >
+                  {formatCurrency(y.taxEffectNet)}
+                </td>
+              ))}
+            </tr>
+            <tr className="bg-slate-900/20">
+              <td className="border border-slate-800 px-2 py-1 font-medium">
+                Total income
+              </td>
+              {years.map((y) => (
+                <td
+                  key={`totalIncome-${y.yearIndex}`}
+                  className="border border-slate-800 px-2 py-1 text-right font-medium"
+                >
+                  {formatCurrency(y.totalIncome)}
+                </td>
+              ))}
+            </tr>
+
+            {/* EXPENSE ROWS */}
+            <tr className="bg-slate-900/40">
+              <td className="border border-slate-800 px-2 py-1 font-semibold">
+                Expenses
+              </td>
+              {years.map((y) => (
+                <td
+                  key={`expense-header-${y.yearIndex}`}
+                  className="border border-slate-800 px-2 py-1"
+                />
+              ))}
+            </tr>
+            <tr>
+              <td className="border border-slate-800 px-2 py-1">
+                Living expenses (excl. mortgage)
+              </td>
+              {years.map((y) => (
+                <td
+                  key={`living-${y.yearIndex}`}
+                  className="border border-slate-800 px-2 py-1 text-right"
+                >
+                  {formatCurrency(y.livingExpenses)}
+                </td>
+              ))}
+            </tr>
+            <tr>
+              <td className="border border-slate-800 px-2 py-1">
+                Home loan repayments (total)
+              </td>
+              {years.map((y) => (
+                <td
+                  key={`homeRepay-${y.yearIndex}`}
+                  className="border border-slate-800 px-2 py-1 text-right"
+                >
+                  {formatCurrency(y.homeLoanRepayments)}
+                </td>
+              ))}
+            </tr>
+            <tr>
+              <td className="border border-slate-800 px-2 py-1">
+                Investment property expenses
+              </td>
+              {years.map((y) => (
+                <td
+                  key={`ipExp-${y.yearIndex}`}
+                  className="border border-slate-800 px-2 py-1 text-right"
+                >
+                  {formatCurrency(y.ipExpenses)}
+                </td>
+              ))}
+            </tr>
+            <tr>
+              <td className="border border-slate-800 px-2 py-1">
+                Investment property interest
+              </td>
+              {years.map((y) => (
+                <td
+                  key={`ipInt-${y.yearIndex}`}
+                  className="border border-slate-800 px-2 py-1 text-right"
+                >
+                  {formatCurrency(y.ipInterest)}
+                </td>
+              ))}
+            </tr>
+            <tr className="bg-slate-900/20">
+              <td className="border border-slate-800 px-2 py-1 font-medium">
+                Total expenses
+              </td>
+              {years.map((y) => (
+                <td
+                  key={`totalExp-${y.yearIndex}`}
+                  className="border border-slate-800 px-2 py-1 text-right font-medium"
+                >
+                  {formatCurrency(y.totalExpenses)}
+                </td>
+              ))}
+            </tr>
+
+            {/* SURPLUS ROW */}
+            <tr>
+              <td className="border border-slate-800 px-2 py-1 font-semibold">
+                Surplus / (shortfall)
+              </td>
+              {years.map((y) => (
+                <td
+                  key={`surplus-${y.yearIndex}`}
+                  className={`border border-slate-800 px-2 py-1 text-right font-semibold ${
+                    y.surplusCashflow >= 0
+                      ? "text-emerald-400"
+                      : "text-rose-400"
+                  }`}
+                >
+                  {formatCurrency(y.surplusCashflow)}
+                </td>
+              ))}
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    {/* Home loan detail table */}
+    {/* Home loan detail table with years as columns */}
+<div>
+  <h3 className="text-sm font-semibold text-slate-100 mb-2">
+    Home loan details
+  </h3>
+  <div className="overflow-x-auto">
+    <table className="min-w-full text-[11px] md:text-xs text-left border-collapse border border-slate-800">
+      <thead className="bg-slate-900">
+        <tr>
+          <th className="border border-slate-800 px-2 py-1 sticky left-0 bg-slate-900">
+            Category
+          </th>
+          {years.map((y) => (
+            <th
+              key={y.yearIndex}
+              className="border border-slate-800 px-2 py-1 text-right whitespace-nowrap"
+            >
+              Year {y.yearIndex + 1}
+            </th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {/* Opening balance */}
+        <tr>
+          <td className="border border-slate-800 px-2 py-1 font-medium">
+            Opening balance
+          </td>
+          {years.map((y, idx) => {
+            const opening =
+              idx === 0
+                ? baseInputs.homeLoanBalance
+                : years[idx - 1].homeLoanBalance;
+            return (
+              <td key={`opening-${idx}`} className="border border-slate-800 px-2 py-1 text-right">
+                {formatCurrency(opening)}
+              </td>
+            );
+          })}
+        </tr>
+
+        {/* Minimum repayments (12 × monthly) */}
+        <tr>
+          <td className="border border-slate-800 px-2 py-1 font-medium">
+            Minimum repayments (12× monthly)
+          </td>
+          {years.map((y, idx) => (
+            <td
+              key={`minRepay-${idx}`}
+              className="border border-slate-800 px-2 py-1 text-right"
+            >
+              {formatCurrency(baseInputs.minRepaymentMonthly * 12)}
+            </td>
+          ))}
+        </tr>
+
+        {/* Additional repayments */}
+        <tr>
+          <td className="border border-slate-800 px-2 py-1 font-medium">
+            Additional repayments
+          </td>
+          {years.map((y, idx) => {
+            const minAnnual = baseInputs.minRepaymentMonthly * 12;
+            const additional = Math.max(0, y.homeLoanRepayments - minAnnual);
+            return (
+              <td
+                key={`additional-${idx}`}
+                className="border border-slate-800 px-2 py-1 text-right"
+              >
+                {formatCurrency(additional)}
+              </td>
+            );
+          })}
+        </tr>
+
+        {/* Offset account balance */}
+        <tr>
+          <td className="border border-slate-800 px-2 py-1 font-medium">
+            Offset balance
+          </td>
+          {years.map((y, idx) => (
+            <td
+              key={`offset-${idx}`}
+              className="border border-slate-800 px-2 py-1 text-right"
+            >
+              {formatCurrency(y.offsetBalance)}
+            </td>
+          ))}
+        </tr>
+
+        {/* Interest charged */}
+        <tr>
+          <td className="border border-slate-800 px-2 py-1 font-medium">
+            Interest charged
+          </td>
+          {years.map((y, idx) => (
+            <td
+              key={`interest-${idx}`}
+              className="border border-slate-800 px-2 py-1 text-right"
+            >
+              {formatCurrency(y.homeLoanInterest)}
+            </td>
+          ))}
+        </tr>
+
+        {/* Closing balance */}
+        <tr>
+          <td className="border border-slate-800 px-2 py-1 font-medium">
+            Closing balance
+          </td>
+          {years.map((y, idx) => (
+            <td
+              key={`closing-${idx}`}
+              className={`border border-slate-800 px-2 py-1 text-right ${
+                y.homeLoanBalance === 0 ? "text-emerald-400 font-semibold" : ""
+              }`}
+            >
+              {formatCurrency(y.homeLoanBalance)}
+            </td>
+          ))}
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+
+    {/* Assets & liabilities table */}
+    {/* Assets & liabilities table with years as columns */}
+<div>
+  <h3 className="text-sm font-semibold text-slate-100 mb-2">
+    Assets & liabilities projection
+  </h3>
+  <div className="overflow-x-auto">
+    <table className="min-w-full text-[11px] md:text-xs text-left border-collapse border border-slate-800">
+      <thead className="bg-slate-900">
+        <tr>
+          <th className="border border-slate-800 px-2 py-1 sticky left-0 bg-slate-900">
+            Category
+          </th>
+          {years.map((y) => (
+            <th
+              key={y.yearIndex}
+              className="border border-slate-800 px-2 py-1 text-right whitespace-nowrap"
+            >
+              Year {y.yearIndex + 1}
+              {y.couldClearHomeLoan && (
+                <span className="ml-1 text-[10px] text-emerald-400">
+                  • can clear
+                </span>
+              )}
+            </th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {/* Home value */}
+        <tr>
+          <td className="border border-slate-800 px-2 py-1 font-medium">
+            Home value
+          </td>
+          {years.map((y) => (
+            <td key={`home-${y.yearIndex}`} className="border border-slate-800 px-2 py-1 text-right">
+              {formatCurrency(y.homeValue)}
+            </td>
+          ))}
+        </tr>
+
+        {/* Investment property value */}
+        <tr>
+          <td className="border border-slate-800 px-2 py-1 font-medium">
+            Investment property value
+          </td>
+          {years.map((y) => (
+            <td key={`ip-${y.yearIndex}`} className="border border-slate-800 px-2 py-1 text-right">
+              {formatCurrency(y.ipValue)}
+            </td>
+          ))}
+        </tr>
+
+        {/* Investment portfolio */}
+        <tr>
+          <td className="border border-slate-800 px-2 py-1 font-medium">
+            Investment portfolio value
+          </td>
+          {years.map((y) => (
+            <td key={`portfolio-${y.yearIndex}`} className="border border-slate-800 px-2 py-1 text-right">
+              {formatCurrency(y.investPortfolioValue)}
+            </td>
+          ))}
+        </tr>
+
+        {/* Offset account */}
+        <tr>
+          <td className="border border-slate-800 px-2 py-1 font-medium">
+            Offset account balance
+          </td>
+          {years.map((y) => (
+            <td key={`offset-${y.yearIndex}`} className="border border-slate-800 px-2 py-1 text-right">
+              {formatCurrency(y.offsetBalance)}
+            </td>
+          ))}
+        </tr>
+
+        {/* Total assets */}
+        <tr className="bg-slate-900/20">
+          <td className="border border-slate-800 px-2 py-1 font-semibold">
+            Total assets
+          </td>
+          {years.map((y) => (
+            <td
+              key={`totalAssets-${y.yearIndex}`}
+              className="border border-slate-800 px-2 py-1 text-right font-semibold text-emerald-400"
+            >
+              {formatCurrency(y.totalAssets)}
+            </td>
+          ))}
+        </tr>
+
+        {/* Home loan */}
+        <tr>
+          <td className="border border-slate-800 px-2 py-1 font-medium">
+            Home loan balance
+          </td>
+          {years.map((y) => (
+            <td
+              key={`loanHome-${y.yearIndex}`}
+              className={`border border-slate-800 px-2 py-1 text-right ${
+                y.homeLoanBalance === 0 ? "text-emerald-400 font-semibold" : ""
+              }`}
+            >
+              {formatCurrency(y.homeLoanBalance)}
+            </td>
+          ))}
+        </tr>
+
+        {/* IP loan */}
+        <tr>
+          <td className="border border-slate-800 px-2 py-1 font-medium">
+            Investment property loan
+          </td>
+          {years.map((y) => (
+            <td key={`loanIP-${y.yearIndex}`} className="border border-slate-800 px-2 py-1 text-right">
+              {formatCurrency(y.ipLoanBalance)}
+            </td>
+          ))}
+        </tr>
+
+        {/* Recycled investment loan */}
+        <tr>
+          <td className="border border-slate-800 px-2 py-1 font-medium">
+            Recycled investment loan
+          </td>
+          {years.map((y) => (
+            <td key={`loanInvest-${y.yearIndex}`} className="border border-slate-800 px-2 py-1 text-right">
+              {formatCurrency(y.investmentLoanBalance)}
+            </td>
+          ))}
+        </tr>
+
+        {/* Total liabilities */}
+        <tr className="bg-slate-900/20">
+          <td className="border border-slate-800 px-2 py-1 font-semibold">
+            Total liabilities
+          </td>
+          {years.map((y) => (
+            <td
+              key={`totalLiabilities-${y.yearIndex}`}
+              className="border border-slate-800 px-2 py-1 text-right font-semibold text-rose-400"
+            >
+              {formatCurrency(y.totalLiabilities)}
+            </td>
+          ))}
+        </tr>
+
+        {/* Net worth */}
+        <tr className="bg-slate-900/30">
+          <td className="border border-slate-800 px-2 py-1 font-semibold">
+            Net worth
+          </td>
+          {years.map((y) => (
+            <td
+              key={`netWorth-${y.yearIndex}`}
+              className="border border-slate-800 px-2 py-1 text-right font-semibold text-emerald-300"
+            >
+              {formatCurrency(y.netWorth)}
+            </td>
+          ))}
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+  </div>
+)}
+
+
           </section>
         </div>
       </main>
+
       {/* Footer Links Section */}
-<section className="mt-16 mb-10 text-center">
-  <h3 className="text-lg font-semibold text-slate-100 mb-4">
-    Explore more tools at FinToolbox
-  </h3>
-  <div className="flex flex-wrap justify-center gap-4 text-sm">
-    <a
-      href="https://fintoolbox.com.au/calculators/tax-calculator"
-      className="text-blue-400 hover:text-blue-300"
-      target="_blank"
-      rel="noopener noreferrer"
-    >
-      Income Tax Calculator
-    </a>
-    <a
-      href="https://fintoolbox.com.au/calculators/mortgage"
-      className="text-blue-400 hover:text-blue-300"
-      target="_blank"
-      rel="noopener noreferrer"
-    >
-      Mortgage Calculator
-    </a>
-    <a
-      href="https://fintoolbox.com.au/calculators/debt-recycling"
-      className="text-blue-400 hover:text-blue-300"
-      target="_blank"
-      rel="noopener noreferrer"
-    >
-      Debt Recycling Calculator
-    </a>
-    <a
-      href="https://fintoolbox.com.au"
-      className="text-blue-400 hover:text-blue-300"
-      target="_blank"
-      rel="noopener noreferrer"
-    >
-      Visit FinToolbox.com.au
-    </a>
-  </div>
-</section>
+      <section className="mt-16 mb-10 text-center">
+        <h3 className="text-lg font-semibold text-slate-100 mb-4">
+          Explore more tools at FinToolbox
+        </h3>
+        <div className="flex flex-wrap justify-center gap-4 text-sm">
+          <a
+            href="https://fintoolbox.com.au/calculators/tax-calculator"
+            className="text-blue-400 hover:text-blue-300"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Income Tax Calculator
+          </a>
+          <a
+            href="https://fintoolbox.com.au/calculators/mortgage"
+            className="text-blue-400 hover:text-blue-300"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Mortgage Calculator
+          </a>
+          <a
+            href="https://fintoolbox.com.au/calculators/debt-recycling"
+            className="text-blue-400 hover:text-blue-300"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Debt Recycling Calculator
+          </a>
+          <a
+            href="https://fintoolbox.com.au"
+            className="text-blue-400 hover:text-blue-300"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Visit FinToolbox.com.au
+          </a>
+        </div>
+      </section>
 
-{/* Footer */}
-<footer className="mt-12 py-8 border-t border-slate-800 text-center text-slate-500 text-sm">
-  <p className="mb-2">
-    Have feedback or questions? Email me at{" "}
-    <EmailLink />
-  </p>
-  <p className="text-xs text-slate-600 mt-3">
-    © {new Date().getFullYear()} DebtPro — A FinToolbox Project.
-    Information is general only and does not consider your personal situation.
-  </p>
-</footer>
-
-
+      {/* Footer */}
+      <footer className="mt-12 py-8 border-t border-slate-800 text-center text-slate-500 text-sm">
+        <p className="mb-2">
+          Have feedback or questions? Email me at <EmailLink />
+        </p>
+        <p className="text-xs text-slate-600 mt-3">
+          © {new Date().getFullYear()} DebtPro — A FinToolbox Project.
+          Information is general only and does not consider your personal
+          situation.
+        </p>
+      </footer>
     </>
   );
 }
@@ -444,18 +1064,46 @@ function InputField({
   suffix?: string;
   helper?: string;
 }) {
-  const handleInputChange = (e: ChangeEvent<HTMLInputElement>) => {
-    // Remove commas and non-digit characters
-    const rawValue = e.target.value.replace(/[^\d.-]/g, "");
-    const numericValue = Number(rawValue);
-    onChange(numericValue);
-  };
+  // Local string state so the user can type "5.", "5.2", etc.
+  const [displayValue, setDisplayValue] = useState<string>("");
 
-  // Format displayed value with thousands separators
-  const formattedValue =
-    value !== null && value !== undefined && !isNaN(value)
-      ? value.toLocaleString("en-AU")
-      : "";
+  // Keep displayValue in sync if the parent value changes externally
+  useEffect(() => {
+    if (
+      value !== null &&
+      value !== undefined &&
+      !Number.isNaN(value)
+    ) {
+      const numericFromDisplay = parseFloat(displayValue);
+      if (Number.isNaN(numericFromDisplay) || numericFromDisplay !== value) {
+        setDisplayValue(value.toString());
+      }
+    } else if (displayValue !== "") {
+      setDisplayValue("");
+    }
+  }, [value]);
+
+  const handleInputChange = (e: ChangeEvent<HTMLInputElement>) => {
+    let rawValue = e.target.value;
+
+    // Allow digits and a single decimal point
+    rawValue = rawValue.replace(/[^0-9.]/g, "");
+
+    const parts = rawValue.split(".");
+    if (parts.length > 2) {
+      rawValue = parts[0] + "." + parts[1];
+    }
+
+    // Max 2 decimal places
+    if (parts[1] && parts[1].length > 2) {
+      rawValue = parts[0] + "." + parts[1].slice(0, 2);
+    }
+
+    setDisplayValue(rawValue);
+
+    const numericValue = parseFloat(rawValue);
+    onChange(Number.isNaN(numericValue) ? 0 : numericValue);
+  };
 
   return (
     <div>
@@ -468,12 +1116,12 @@ function InputField({
         )}
         <input
           type="text"
-          inputMode="numeric"
+          inputMode="decimal"
           className={`w-full bg-slate-900 border border-slate-700 rounded-lg 
             ${prefix ? "pl-7 pr-3" : "px-3"} 
             py-2 text-sm text-slate-100 
             focus:outline-none focus:ring-2 focus:ring-blue-500/40`}
-          value={formattedValue}
+          value={displayValue}
           onChange={handleInputChange}
         />
         {suffix && (
