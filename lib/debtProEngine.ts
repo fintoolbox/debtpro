@@ -58,12 +58,14 @@ export type YearState = {
 
   homeLoanInterest: number;
   homeLoanRepayments: number; // total paid this year towards home loan
+  minRepaymentMonthly: number; // minimum required in this year
 
   ipRent: number;
   ipExpenses: number;
   ipInterest: number;
 
   investIncome: number;
+  investContributions: number; // recycled debt drawn & invested this year
   taxEffectNet: number; // net tax benefit / (extra tax) from IP + investments
 
   totalIncome: number;
@@ -106,6 +108,9 @@ const DEFAULT_ASSUMPTIONS: Assumptions = {
   effectiveCgtRate: 0.10,
 };
 
+// Simple CPI assumption used for living costs and IP rent/expenses
+const CPI_RATE = 0.03;
+
 // ─────────────────────────────────────────────
 // 3. Main entry point
 // ─────────────────────────────────────────────
@@ -125,21 +130,26 @@ export function runDebtProSimulation(
   // Running state across years
   let netIncome = base.netIncomeAnnual;
   let livingExpenses = base.livingExpensesAnnualExMortgage;
+  let minRepaymentMonthly = base.minRepaymentMonthly;
 
   let homeValue = base.propertyValueHome;
   let homeLoanBalance = base.homeLoanBalance;
 
   let offsetBalance = base.offsetBalance;
 
-  // Tip 5 / 6 state (we’ll flesh out later)
+  // Tip 5 / 6 state (we'll flesh out later)
   let ipValue = 0;
   let ipLoanBalance = 0;
   let hasPurchasedIP = false;
+  let purchasedIPThisYear = false;
+  let ipPurchaseYearIndex: number | null = null;
 
   let investPortfolioValue = 0;
   let investmentLoanBalance = 0; // recycled, deductible debt
 
   let debtFreeYearIndex: number | undefined;
+
+  const baseMinRepaymentMonthly = base.minRepaymentMonthly;
 
   for (let yearIndex = 0; yearIndex < assumptions.projectionYears; yearIndex++) {
     // ─────────────────────────────────────────
@@ -147,24 +157,34 @@ export function runDebtProSimulation(
     // ─────────────────────────────────────────
     if (yearIndex > 0) {
       homeValue *= 1 + assumptions.homeGrowthRate;
+      livingExpenses *= 1 + CPI_RATE; // grow living costs with CPI
     }
 
     // ─────────────────────────────────────────
-    // 3.2 Tip 4 – salary growth
+    // 3.2 Tip 4 - salary growth
     // ─────────────────────────────────────────
     let extraIncomeToMortgage = 0;
     if (yearIndex > 0 && tips.tip4_salaryGrowthRate > 0) {
       const previousIncome = netIncome;
       netIncome = netIncome * (1 + tips.tip4_salaryGrowthRate);
       const extraIncome = netIncome - previousIncome;
-      extraIncomeToMortgage = 0.5 * extraIncome; // 50% of net increase
+      extraIncomeToMortgage = 0; // strategy now directs salary growth via min-based uplift below
     }
 
     // ─────────────────────────────────────────
-    // 3.3 Tips 1 + 3 + 4 – annual home loan repayments
+    // 3.3 Tips 1 + 3 + 4 - annual home loan repayments
     // ─────────────────────────────────────────
+    const salaryGrowthFactor =
+      tips.tip4_salaryGrowthRate > 0
+        ? Math.pow(1 + tips.tip4_salaryGrowthRate, yearIndex) - 1
+        : 0;
+    const salaryGrowthExtraMonthly =
+      baseMinRepaymentMonthly * salaryGrowthFactor;
+
     const baseMonthlyRepayment =
-      base.minRepaymentMonthly + tips.tip1_extraSavingsPerMonth;
+      baseMinRepaymentMonthly +
+      tips.tip1_extraSavingsPerMonth +
+      salaryGrowthExtraMonthly;
 
     // Tip 3: pay fortnightly = 13 "months" of repayments per year
     const annualRepaymentFromBaseAndTip1And3 = baseMonthlyRepayment * 13;
@@ -211,16 +231,18 @@ let ipInterest = 0;
 
 // Buy the IP when 80% of home value minus home loan
 // (usable equity) is at least 30% of the IP purchase price.
-if (!hasPurchasedIP && tips.tip5_purchasePrice > 0) {
-  const usableEquity = Math.max(0, homeValue * 0.8 - homeLoanBalance);
-  const requiredEquity = 0.3 * tips.tip5_purchasePrice;
+  if (!hasPurchasedIP && tips.tip5_purchasePrice > 0) {
+    const usableEquity = Math.max(0, homeValue * 0.8 - homeLoanBalance);
+    const requiredEquity = 0.3 * tips.tip5_purchasePrice;
 
-  if (usableEquity >= requiredEquity) {
-    hasPurchasedIP = true;
-    ipValue = tips.tip5_purchasePrice;
+    if (usableEquity >= requiredEquity) {
+      hasPurchasedIP = true;
+      purchasedIPThisYear = true;
+      ipPurchaseYearIndex = yearIndex;
+      ipValue = tips.tip5_purchasePrice;
 
-    const purchaseCostRate = tips.tip5_purchaseCostsRate ?? 0;
-    const purchaseCosts = tips.tip5_purchasePrice * purchaseCostRate;
+      const purchaseCostRate = tips.tip5_purchaseCostsRate ?? 0;
+      const purchaseCosts = tips.tip5_purchasePrice * purchaseCostRate;
 
     // 100% debt funded: price + costs
     ipLoanBalance = tips.tip5_purchasePrice + purchaseCosts;
@@ -231,8 +253,12 @@ if (hasPurchasedIP) {
   // simple growth after purchase
   ipValue *= 1 + assumptions.ipGrowthRate;
 
-  ipRent = tips.tip5_rentAnnual;
-  ipExpenses = tips.tip5_expensesAnnual;
+  const ipYearsHeld =
+    ipPurchaseYearIndex !== null ? yearIndex - ipPurchaseYearIndex : 0;
+  const rentGrowthFactor = Math.pow(1 + CPI_RATE, ipYearsHeld);
+
+  ipRent = tips.tip5_rentAnnual * rentGrowthFactor;
+  ipExpenses = tips.tip5_expensesAnnual * rentGrowthFactor;
   ipInterest = ipLoanBalance * tips.tip5_ipLoanRate;
 
   // v1: assume interest-only IP loan
@@ -249,11 +275,23 @@ let debtRecyclingInterest = 0;
 let investContributions = 0;
 
 // Only start recycling AFTER the IP has been purchased
-if (tips.tip6_recyclePerYear > 0 && homeLoanBalance > 0 && hasPurchasedIP) {
-  investContributions = Math.min(
-    tips.tip6_recyclePerYear,
-    homeLoanBalance
+if (hasPurchasedIP && homeLoanBalance > 0) {
+  const minAnnualRepay = baseMinRepaymentMonthly * 13;
+  const additionalRepayments = Math.max(
+    0,
+    annualHomeLoanRepayments - minAnnualRepay
   );
+
+  // First-year kick-off amount (user input)
+  if (purchasedIPThisYear && tips.tip6_recyclePerYear > 0) {
+    investContributions += Math.min(tips.tip6_recyclePerYear, homeLoanBalance);
+  }
+
+  // Ongoing recycling equals the annual repayments above the minimum
+  if (additionalRepayments > 0) {
+    const availableHeadroom = Math.max(0, homeLoanBalance - investContributions);
+    investContributions += Math.min(additionalRepayments, availableHeadroom);
+  }
 
   investmentLoanBalance += investContributions;
   // The recycled amount is invested
@@ -374,13 +412,15 @@ const couldClearHomeLoan =
 
       homeLoanInterest,
       homeLoanRepayments: annualHomeLoanRepayments,
+      minRepaymentMonthly: baseMinRepaymentMonthly,
 
       ipRent,
       ipExpenses,
       ipInterest,
 
-      investIncome,
-      taxEffectNet,
+  investIncome,
+  investContributions,
+  taxEffectNet,
 
       totalIncome,
       totalExpenses,
